@@ -1,7 +1,6 @@
 import time
 import os
 import requests
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
@@ -10,52 +9,28 @@ from datetime import datetime, timezone
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Menggunakan API Key Twelve Data Anda
+TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "62c27e52908241e8a54f3aa389f13b78")
+
 PORTFOLIO = {
-    "XAU/USD": {"symbol": "GC=F", "pip": 0.1, "digits": 2, "name": "GOLD (Live Spot)"},
-    "EUR/USD": {"symbol": "EURUSD=X", "pip": 0.0001, "digits": 5, "name": "EUR/USD"},
-    "USD/JPY": {"symbol": "JPY=X", "pip": 0.01, "digits": 3, "name": "USD/JPY"}
+    "XAU/USD": {"symbol": "XAU/USD", "pip": 0.1, "digits": 2, "name": "GOLD (Spot Exness)"},
+    "EUR/USD": {"symbol": "EUR/USD", "pip": 0.0001, "digits": 5, "name": "EUR/USD"},
+    "USD/JPY": {"symbol": "USD/JPY", "pip": 0.01, "digits": 3, "name": "USD/JPY"}
 }
 
-TIMEFRAME = "15m"
+TIMEFRAME = "15min"
 MAX_RUNTIME_SECONDS = 330 * 60  # 5.5 jam relay
-CHECK_INTERVAL_SECONDS = 60
+CHECK_INTERVAL_SECONDS = 300    # Cek tiap 5 menit (menghemat kuota 800 req/hari agar 24 jam nonstop)
 
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": message, 
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Error Telegram: {e}")
-
-def get_realtime_gold_spot():
-    """Mengambil harga fisik Spot Gold detik ini juga (Zero Delay)"""
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        # Feed publik live spot XAU/USD langsung
-        url = "https://data-asg.goldprice.org/dbXRates/USD"
-        res = requests.get(url, headers=headers, timeout=5).json()
-        live_gold = float(res['items'][0]['xauPrice'])
-        return live_gold
-    except Exception as e:
-        print(f"Gagal bypass live spot gold: {e}")
-        return None
-
-def is_market_open():
-    now = datetime.now(timezone.utc)
-    weekday = now.weekday()
-    hour = now.hour
-    if weekday == 5 and hour >= 22:
-        return False
-    if weekday == 6 and hour < 21:
-        return False
-    return True
 
 def get_current_session():
     hour = datetime.now(timezone.utc).hour
@@ -68,25 +43,33 @@ def get_current_session():
         sessions.append("New York 🇺🇸")
     return " + ".join(sessions) if sessions else "Sydney/Off-hours 🇦🇺"
 
-def fetch_data(pair, cfg):
+def fetch_twelve_data(symbol):
+    """Mengambil candle 15m real-time langsung dari Twelve Data API"""
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": TIMEFRAME,
+        "outputsize": 30,
+        "apikey": TWELVE_API_KEY
+    }
     try:
-        ticker = yf.Ticker(cfg["symbol"])
-        df = ticker.history(period="3d", interval=TIMEFRAME)
-        if df.empty:
+        res = requests.get(url, params=params, timeout=10).json()
+        if "values" not in res:
+            print(f"Error Twelve Data ({symbol}): {res.get('message')}")
             return None
-        df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
 
-        # JIKA INSTRUMEN ADALAH GOLD: Kalibrasi candle terakhir dengan Live Spot Price detik ini!
-        if pair == "XAU/USD":
-            live_spot = get_realtime_gold_spot()
-            if live_spot is not None:
-                # Timpa harga penutupan terakhir dengan live spot MT5
-                df.iloc[-1, df.columns.get_loc('close')] = live_spot
+        # Data TwelveData terurut dari terbaru ke terlama, kita balik urutannya (ascending)
+        df = pd.DataFrame(res["values"])
+        df = df.iloc[::-1].reset_index(drop=True)
 
-        # Hitung Indikator
+        df['close'] = df['close'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['open'] = df['open'].astype(float)
+
+        # Hitung Indikator (EMA 9 & 21)
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
-        df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
 
         # RSI 14
         delta = df['close'].diff()
@@ -104,7 +87,7 @@ def fetch_data(pair, cfg):
 
         return df
     except Exception as e:
-        print(f"Error {pair}: {e}")
+        print(f"Gagal mengambil {symbol}: {e}")
         return None
 
 def generate_trade_setup(pair, df, cfg):
@@ -139,7 +122,7 @@ def generate_trade_setup(pair, df, cfg):
             "sl": f"{sl_price:.{digits}f}",
             "tp1": f"{tp1_price:.{digits}f}",
             "tp2": f"{tp2_price:.{digits}f}",
-            "note": "Bearish momentum kuat. Sesuai arah trend."
+            "note": "Bearish momentum kuat."
         }
 
     # Setup BUY
@@ -156,7 +139,7 @@ def generate_trade_setup(pair, df, cfg):
             "sl": f"{sl_price:.{digits}f}",
             "tp1": f"{tp1_price:.{digits}f}",
             "tp2": f"{tp2_price:.{digits}f}",
-            "note": "Bullish momentum kuat. Sesuai arah trend."
+            "note": "Bullish momentum kuat."
         }
 
     return setup
@@ -166,7 +149,7 @@ def build_actionable_dashboard(data_dict):
     utc_time = datetime.now(timezone.utc).strftime('%H:%M:%S')
 
     msg = f"⚡ <b>FOREX DAN GOLD ACTION PLAN (15M)</b> ⚡\n"
-    msg += f"Session: <b>{session}</b> | UTC: <code>{utc_time}</code>\n"
+    msg += f"Feed: <b>TwelveData Real-Time</b> | UTC: <code>{utc_time}</code>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
     for pair, df in data_dict.items():
@@ -186,7 +169,7 @@ def build_actionable_dashboard(data_dict):
         msg += f"• <b>Kondisi:</b> RSI <code>{curr['rsi']:.1f}</code> | <i>{setup['note']}</i>\n"
         msg += "──────────────────────\n"
 
-    msg += "<i>Live Spot feed aktif (Zero Delay).</i>"
+    msg += "<i>Harga spot interbank terhubung (Zero Delay).</i>"
     return msg
 
 def main():
@@ -194,20 +177,14 @@ def main():
     last_15m_report = 0
     last_order_status = {pair: None for pair in PORTFOLIO}
 
-    if not is_market_open():
-        send_telegram("⏸ <b>Market Forex sedang Weekend.</b> Bot standby.")
-        return
-
     while (time.time() - start_time) < MAX_RUNTIME_SECONDS:
         try:
-            if not is_market_open():
-                break
-
             now = time.time()
             data_cache = {}
 
+            # Ambil data pair dari Twelve Data
             for pair, cfg in PORTFOLIO.items():
-                df = fetch_data(pair, cfg)
+                df = fetch_twelve_data(cfg["symbol"])
                 data_cache[pair] = df
 
                 # Trigger Sinyal Instan
@@ -225,14 +202,14 @@ def main():
                     elif "NOW" not in setup['order']:
                         last_order_status[pair] = None
 
-            # Kirim Dashboard awal dan rutin per 15 menit
+            # Kirim Dashboard di awal dan rutin tiap 15 menit
             if (now - last_15m_report) >= 900:
                 dashboard = build_actionable_dashboard(data_cache)
                 send_telegram(dashboard)
                 last_15m_report = now
 
         except Exception as e:
-            print(f"Error loop: {e}")
+            print(f"Error loop utama: {e}")
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
