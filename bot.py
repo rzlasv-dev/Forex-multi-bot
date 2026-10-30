@@ -11,24 +11,31 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 PORTFOLIO = {
-    "XAU/USD": {"type": "binance_spot", "symbol": "PAXGUSDT", "pip": 0.1, "digits": 2, "name": "GOLD (Spot)"},
-    "EUR/USD": {"type": "yfinance", "symbol": "EURUSD=X", "pip": 0.0001, "digits": 5, "name": "EUR/USD"},
-    "USD/JPY": {"type": "yfinance", "symbol": "JPY=X", "pip": 0.01, "digits": 3, "name": "USD/JPY"}
+    "XAU/USD": {"symbol": "GC=F", "pip": 0.1, "digits": 2, "name": "GOLD"},
+    "EUR/USD": {"symbol": "EURUSD=X", "pip": 0.0001, "digits": 5, "name": "EUR/USD"},
+    "USD/JPY": {"symbol": "JPY=X", "pip": 0.01, "digits": 3, "name": "USD/JPY"}
 }
 
 TIMEFRAME = "15m"
-MAX_RUNTIME_SECONDS = 330 * 60  # 5.5 jam per siklus
+MAX_RUNTIME_SECONDS = 330 * 60  # 5.5 jam relay
 CHECK_INTERVAL_SECONDS = 60
 
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Token atau Chat ID kosong!")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID, 
+        "text": message, 
+        "parse_mode": "HTML"
+    }
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"Error respon Telegram: {res.text}")
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Error kirim Telegram: {e}")
 
 def is_market_open():
     now = datetime.now(timezone.utc)
@@ -49,31 +56,17 @@ def get_current_session():
         sessions.append("London 🇬🇧")
     if 13 <= hour < 22:
         sessions.append("New York 🇺🇸")
-    return " & ".join(sessions) if sessions else "Sydney/Off-hours 🇦🇺"
+    return " + ".join(sessions) if sessions else "Sydney/Off-hours 🇦🇺"
 
 def fetch_data(pair, cfg):
-    """Mengambil data real-time: Binance Public API untuk Gold (Zero Delay), Yahoo untuk FX"""
     try:
-        if cfg["type"] == "binance_spot":
-            # Ambil candle Spot Gold real-time tanpa delay 15 menit
-            url = f"https://api.binance.com/api/v3/klines?symbol={cfg['symbol']}&interval=15m&limit=100"
-            res = requests.get(url, timeout=10).json()
-            df = pd.DataFrame(res, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
-            ])
-            df['close'] = df['close'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
-            df['open'] = df['open'].astype(float)
-        else:
-            ticker = yf.Ticker(cfg["symbol"])
-            df = ticker.history(period="3d", interval=TIMEFRAME)
-            if df.empty:
-                return None
-            df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
+        ticker = yf.Ticker(cfg["symbol"])
+        df = ticker.history(period="3d", interval=TIMEFRAME)
+        if df.empty:
+            return None
+        df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
 
-        # Hitung Indikator Cepat (EMA 9 & 21)
+        # EMA 9, 21, 50
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
@@ -94,7 +87,7 @@ def fetch_data(pair, cfg):
 
         return df
     except Exception as e:
-        print(f"Error fetching {pair}: {e}")
+        print(f"Gagal mengambil {pair}: {e}")
         return None
 
 def generate_trade_setup(pair, df, cfg):
@@ -129,7 +122,7 @@ def generate_trade_setup(pair, df, cfg):
             "sl": f"{sl_price:.{digits}f}",
             "tp1": f"{tp1_price:.{digits}f}",
             "tp2": f"{tp2_price:.{digits}f}",
-            "note": "Bearish trend. Target pullback EMA 9."
+            "note": "Bearish momentum. Rejeksi EMA 9."
         }
 
     # Setup BUY
@@ -146,7 +139,7 @@ def generate_trade_setup(pair, df, cfg):
             "sl": f"{sl_price:.{digits}f}",
             "tp1": f"{tp1_price:.{digits}f}",
             "tp2": f"{tp2_price:.{digits}f}",
-            "note": "Bullish trend. Target pullback EMA 9."
+            "note": "Bullish momentum. Rebound EMA 9."
         }
 
     return setup
@@ -155,8 +148,8 @@ def build_actionable_dashboard(data_dict):
     session = get_current_session()
     utc_time = datetime.now(timezone.utc).strftime('%H:%M:%S')
 
-    msg = f"⚡ *REAL-TIME ACTION PLAN (15M)* ⚡\n"
-    msg += f"Session: `{session}` | UTC: `{utc_time}`\n"
+    msg = f"⚡ <b>FOREX DAN GOLD ACTION PLAN (15M)</b> ⚡\n"
+    msg += f"Session: <b>{session}</b> | UTC: <code>{utc_time}</code>\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
     for pair, df in data_dict.items():
@@ -167,16 +160,16 @@ def build_actionable_dashboard(data_dict):
         setup = generate_trade_setup(pair, df, cfg)
         digits = cfg["digits"]
 
-        msg += f"🎯 *{pair}* | Live Price: `{curr['close']:.{digits}f}`\n"
-        msg += f"• *Order:* `{setup['order']}`\n"
-        msg += f"• *Entry Area:* `{setup['entry']}`\n"
-        msg += f"• *Stop Loss (SL):* `{setup['sl']}`\n"
-        msg += f"• *Take Profit 1:* `{setup['tp1']}`\n"
-        msg += f"• *Take Profit 2:* `{setup['tp2']}`\n"
-        msg += f"• *Kondisi:* RSI `{curr['rsi']:.1f}` | _{setup['note']}_\n"
+        msg += f"🎯 <b>{pair}</b> | Price: <code>{curr['close']:.{digits}f}</code>\n"
+        msg += f"• <b>Order:</b> <code>{setup['order']}</code>\n"
+        msg += f"• <b>Entry Area:</b> <code>{setup['entry']}</code>\n"
+        msg += f"• <b>Stop Loss (SL):</b> <code>{setup['sl']}</code>\n"
+        msg += f"• <b>Take Profit 1:</b> <code>{setup['tp1']}</code>\n"
+        msg += f"• <b>Take Profit 2:</b> <code>{setup['tp2']}</code>\n"
+        msg += f"• <b>Kondisi:</b> RSI <code>{curr['rsi']:.1f}</code> | <i>{setup['note']}</i>\n"
         msg += "──────────────────────\n"
 
-    msg += "_Real-time spot data terhubung._"
+    msg += "<i>Trigger real-time aktif scan tiap 60 detik.</i>"
     return msg
 
 def main():
@@ -185,10 +178,11 @@ def main():
     last_order_status = {pair: None for pair in PORTFOLIO}
 
     if not is_market_open():
-        send_telegram("⏸ *Market Forex sedang Weekend.* Bot standby.")
+        send_telegram("⏸ <b>Market Forex sedang Weekend.</b> Bot standby.")
         return
 
-    send_telegram("⚡ *Bot Real-Time Aktif:* Feed Spot Gold Binance & Forex Live aktif.")
+    # Kirim salam pembuka versi TERBARU
+    send_telegram("🚀 <b>Bot Forex Multi-Pair Aktif.</b> Membaca data dan setup...")
 
     while (time.time() - start_time) < MAX_RUNTIME_SECONDS:
         try:
@@ -198,31 +192,34 @@ def main():
             now = time.time()
             data_cache = {}
 
+            # Ambil data semua pair
             for pair, cfg in PORTFOLIO.items():
                 df = fetch_data(pair, cfg)
                 data_cache[pair] = df
 
+                # Trigger Sinyal Instan
                 if df is not None:
                     setup = generate_trade_setup(pair, df, cfg)
                     if "NOW" in setup['order'] and last_order_status[pair] != setup['order']:
                         alert_msg = (
-                            f"🚨 *TRIGGER EXECUTION ALERT: {pair}* 🚨\n"
-                            f"Action: `{setup['order']}`\n"
-                            f"Price: `{setup['entry']}`\n"
-                            f"SL: `{setup['sl']}` | TP: `{setup['tp1']}`"
+                            f"🚨 <b>TRIGGER EXECUTION: {pair}</b> 🚨\n\n"
+                            f"Action: <code>{setup['order']}</code>\n"
+                            f"Price: <code>{setup['entry']}</code>\n"
+                            f"SL: <code>{setup['sl']}</code> | TP1: <code>{setup['tp1']}</code>"
                         )
                         send_telegram(alert_msg)
                         last_order_status[pair] = setup['order']
                     elif "NOW" not in setup['order']:
                         last_order_status[pair] = None
 
+            # Kirim Dashboard: LANGSUNG DI DETIK PERTAMA, lalu tiap 15 menit
             if (now - last_15m_report) >= 900:
                 dashboard = build_actionable_dashboard(data_cache)
                 send_telegram(dashboard)
                 last_15m_report = now
 
         except Exception as e:
-            print(f"Error loop: {e}")
+            print(f"Error loop utama: {e}")
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
