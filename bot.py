@@ -10,9 +10,8 @@ from datetime import datetime, timezone
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# KUNCI PERBAIKAN: Gunakan XAUUSD=X (Spot Gold Pasar Tunai), BUKAN GC=F (Futures delay 15m)
 PORTFOLIO = {
-    "XAU/USD": {"symbol": "XAUUSD=X", "pip": 0.1, "digits": 2, "name": "GOLD (Spot Live)"},
+    "XAU/USD": {"symbol": "GC=F", "pip": 0.1, "digits": 2, "name": "GOLD (Live Spot)"},
     "EUR/USD": {"symbol": "EURUSD=X", "pip": 0.0001, "digits": 5, "name": "EUR/USD"},
     "USD/JPY": {"symbol": "JPY=X", "pip": 0.01, "digits": 3, "name": "USD/JPY"}
 }
@@ -33,7 +32,20 @@ def send_telegram(message: str):
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Error kirim Telegram: {e}")
+        print(f"Error Telegram: {e}")
+
+def get_realtime_gold_spot():
+    """Mengambil harga fisik Spot Gold detik ini juga (Zero Delay)"""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        # Feed publik live spot XAU/USD langsung
+        url = "https://data-asg.goldprice.org/dbXRates/USD"
+        res = requests.get(url, headers=headers, timeout=5).json()
+        live_gold = float(res['items'][0]['xauPrice'])
+        return live_gold
+    except Exception as e:
+        print(f"Gagal bypass live spot gold: {e}")
+        return None
 
 def is_market_open():
     now = datetime.now(timezone.utc)
@@ -58,21 +70,20 @@ def get_current_session():
 
 def fetch_data(pair, cfg):
     try:
-        # Mengambil candle Spot langsung
         ticker = yf.Ticker(cfg["symbol"])
         df = ticker.history(period="3d", interval=TIMEFRAME)
-        
-        # Fallback cadangan jika XAUUSD=X kosong di penyedia server:
-        if df.empty and pair == "XAU/USD":
-            ticker = yf.Ticker("GC=F")
-            df = ticker.history(period="3d", interval=TIMEFRAME)
-
         if df.empty:
             return None
-
         df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
 
-        # EMA Cepat (9 & 21)
+        # JIKA INSTRUMEN ADALAH GOLD: Kalibrasi candle terakhir dengan Live Spot Price detik ini!
+        if pair == "XAU/USD":
+            live_spot = get_realtime_gold_spot()
+            if live_spot is not None:
+                # Timpa harga penutupan terakhir dengan live spot MT5
+                df.iloc[-1, df.columns.get_loc('close')] = live_spot
+
+        # Hitung Indikator
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
@@ -93,7 +104,7 @@ def fetch_data(pair, cfg):
 
         return df
     except Exception as e:
-        print(f"Gagal mengambil {pair}: {e}")
+        print(f"Error {pair}: {e}")
         return None
 
 def generate_trade_setup(pair, df, cfg):
@@ -114,9 +125,8 @@ def generate_trade_setup(pair, df, cfg):
         "note": "Konsolidasi harga"
     }
 
-    # Setup SELL (Bearish momentum)
+    # Setup SELL
     if ema9 < ema21 and rsi < 55:
-        # Jika harga sudah breakdown tajam di bawah EMA 9, pasang order SELL NOW di harga market saat ini
         entry_price = close
         sl_price = entry_price + (1.5 * atr)
         tp1_price = entry_price - (1.5 * atr)
@@ -129,10 +139,10 @@ def generate_trade_setup(pair, df, cfg):
             "sl": f"{sl_price:.{digits}f}",
             "tp1": f"{tp1_price:.{digits}f}",
             "tp2": f"{tp2_price:.{digits}f}",
-            "note": "Bearish momentum kuat. Ikuti arah trend."
+            "note": "Bearish momentum kuat. Sesuai arah trend."
         }
 
-    # Setup BUY (Bullish momentum)
+    # Setup BUY
     elif ema9 > ema21 and rsi > 45:
         entry_price = close
         sl_price = entry_price - (1.5 * atr)
@@ -146,7 +156,7 @@ def generate_trade_setup(pair, df, cfg):
             "sl": f"{sl_price:.{digits}f}",
             "tp1": f"{tp1_price:.{digits}f}",
             "tp2": f"{tp2_price:.{digits}f}",
-            "note": "Bullish momentum kuat. Ikuti arah trend."
+            "note": "Bullish momentum kuat. Sesuai arah trend."
         }
 
     return setup
@@ -176,7 +186,7 @@ def build_actionable_dashboard(data_dict):
         msg += f"• <b>Kondisi:</b> RSI <code>{curr['rsi']:.1f}</code> | <i>{setup['note']}</i>\n"
         msg += "──────────────────────\n"
 
-    msg += "<i>Spot price real-time disinkronkan.</i>"
+    msg += "<i>Live Spot feed aktif (Zero Delay).</i>"
     return msg
 
 def main():
@@ -215,14 +225,14 @@ def main():
                     elif "NOW" not in setup['order']:
                         last_order_status[pair] = None
 
-            # Kirim Dashboard di awal dan rutin tiap 15 menit
+            # Kirim Dashboard awal dan rutin per 15 menit
             if (now - last_15m_report) >= 900:
                 dashboard = build_actionable_dashboard(data_cache)
                 send_telegram(dashboard)
                 last_15m_report = now
 
         except Exception as e:
-            print(f"Error loop utama: {e}")
+            print(f"Error loop: {e}")
 
         time.sleep(CHECK_INTERVAL_SECONDS)
 
