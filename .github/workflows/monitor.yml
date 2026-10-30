@@ -5,6 +5,11 @@ on:
   repository_dispatch:
     types: [next-relay]
 
+# PENGAMAN UTAMA: Otomatis bunuh runner lama jika ada runner baru aktif
+concurrency:
+  group: forex-runner-singleton
+  cancel-in-progress: true
+
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
@@ -31,8 +36,9 @@ jobs:
         run: |
           python bot.py
 
+      # HANYA pemicu relay jika selesai normal (tidak akan relay jika dibatalkan/error)
       - name: Auto-Relay to Next Runner
-        if: always()
+        if: success()
         run: |
           curl -X POST \
             -H "Accept: application/vnd.github.v3+json" \
