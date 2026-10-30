@@ -10,8 +10,9 @@ from datetime import datetime, timezone
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# KUNCI PERBAIKAN: Gunakan XAUUSD=X (Spot Gold Pasar Tunai), BUKAN GC=F (Futures delay 15m)
 PORTFOLIO = {
-    "XAU/USD": {"symbol": "GC=F", "pip": 0.1, "digits": 2, "name": "GOLD"},
+    "XAU/USD": {"symbol": "XAUUSD=X", "pip": 0.1, "digits": 2, "name": "GOLD (Spot Live)"},
     "EUR/USD": {"symbol": "EURUSD=X", "pip": 0.0001, "digits": 5, "name": "EUR/USD"},
     "USD/JPY": {"symbol": "JPY=X", "pip": 0.01, "digits": 3, "name": "USD/JPY"}
 }
@@ -22,7 +23,6 @@ CHECK_INTERVAL_SECONDS = 60
 
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Token atau Chat ID kosong!")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -31,9 +31,7 @@ def send_telegram(message: str):
         "parse_mode": "HTML"
     }
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code != 200:
-            print(f"Error respon Telegram: {res.text}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Error kirim Telegram: {e}")
 
@@ -60,13 +58,21 @@ def get_current_session():
 
 def fetch_data(pair, cfg):
     try:
+        # Mengambil candle Spot langsung
         ticker = yf.Ticker(cfg["symbol"])
         df = ticker.history(period="3d", interval=TIMEFRAME)
+        
+        # Fallback cadangan jika XAUUSD=X kosong di penyedia server:
+        if df.empty and pair == "XAU/USD":
+            ticker = yf.Ticker("GC=F")
+            df = ticker.history(period="3d", interval=TIMEFRAME)
+
         if df.empty:
             return None
+
         df = df.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
 
-        # EMA 9, 21, 50
+        # EMA Cepat (9 & 21)
         df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
         df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
@@ -108,9 +114,10 @@ def generate_trade_setup(pair, df, cfg):
         "note": "Konsolidasi harga"
     }
 
-    # Setup SELL
+    # Setup SELL (Bearish momentum)
     if ema9 < ema21 and rsi < 55:
-        entry_price = max(close, ema9)
+        # Jika harga sudah breakdown tajam di bawah EMA 9, pasang order SELL NOW di harga market saat ini
+        entry_price = close
         sl_price = entry_price + (1.5 * atr)
         tp1_price = entry_price - (1.5 * atr)
         tp2_price = entry_price - (3.0 * atr)
@@ -122,12 +129,12 @@ def generate_trade_setup(pair, df, cfg):
             "sl": f"{sl_price:.{digits}f}",
             "tp1": f"{tp1_price:.{digits}f}",
             "tp2": f"{tp2_price:.{digits}f}",
-            "note": "Bearish momentum. Rejeksi EMA 9."
+            "note": "Bearish momentum kuat. Ikuti arah trend."
         }
 
-    # Setup BUY
+    # Setup BUY (Bullish momentum)
     elif ema9 > ema21 and rsi > 45:
-        entry_price = min(close, ema9)
+        entry_price = close
         sl_price = entry_price - (1.5 * atr)
         tp1_price = entry_price + (1.5 * atr)
         tp2_price = entry_price + (3.0 * atr)
@@ -139,7 +146,7 @@ def generate_trade_setup(pair, df, cfg):
             "sl": f"{sl_price:.{digits}f}",
             "tp1": f"{tp1_price:.{digits}f}",
             "tp2": f"{tp2_price:.{digits}f}",
-            "note": "Bullish momentum. Rebound EMA 9."
+            "note": "Bullish momentum kuat. Ikuti arah trend."
         }
 
     return setup
@@ -160,16 +167,16 @@ def build_actionable_dashboard(data_dict):
         setup = generate_trade_setup(pair, df, cfg)
         digits = cfg["digits"]
 
-        msg += f"🎯 <b>{pair}</b> | Price: <code>{curr['close']:.{digits}f}</code>\n"
+        msg += f"🎯 <b>{pair}</b> | Live Spot: <code>{curr['close']:.{digits}f}</code>\n"
         msg += f"• <b>Order:</b> <code>{setup['order']}</code>\n"
-        msg += f"• <b>Entry Area:</b> <code>{setup['entry']}</code>\n"
+        msg += f"• <b>Entry:</b> <code>{setup['entry']}</code>\n"
         msg += f"• <b>Stop Loss (SL):</b> <code>{setup['sl']}</code>\n"
         msg += f"• <b>Take Profit 1:</b> <code>{setup['tp1']}</code>\n"
         msg += f"• <b>Take Profit 2:</b> <code>{setup['tp2']}</code>\n"
         msg += f"• <b>Kondisi:</b> RSI <code>{curr['rsi']:.1f}</code> | <i>{setup['note']}</i>\n"
         msg += "──────────────────────\n"
 
-    msg += "<i>Trigger real-time aktif scan tiap 60 detik.</i>"
+    msg += "<i>Spot price real-time disinkronkan.</i>"
     return msg
 
 def main():
@@ -181,9 +188,6 @@ def main():
         send_telegram("⏸ <b>Market Forex sedang Weekend.</b> Bot standby.")
         return
 
-    # Kirim salam pembuka versi TERBARU
-    send_telegram("🚀 <b>Bot Forex Multi-Pair Aktif.</b> Membaca data dan setup...")
-
     while (time.time() - start_time) < MAX_RUNTIME_SECONDS:
         try:
             if not is_market_open():
@@ -192,7 +196,6 @@ def main():
             now = time.time()
             data_cache = {}
 
-            # Ambil data semua pair
             for pair, cfg in PORTFOLIO.items():
                 df = fetch_data(pair, cfg)
                 data_cache[pair] = df
@@ -204,7 +207,7 @@ def main():
                         alert_msg = (
                             f"🚨 <b>TRIGGER EXECUTION: {pair}</b> 🚨\n\n"
                             f"Action: <code>{setup['order']}</code>\n"
-                            f"Price: <code>{setup['entry']}</code>\n"
+                            f"Live Entry: <code>{setup['entry']}</code>\n"
                             f"SL: <code>{setup['sl']}</code> | TP1: <code>{setup['tp1']}</code>"
                         )
                         send_telegram(alert_msg)
@@ -212,7 +215,7 @@ def main():
                     elif "NOW" not in setup['order']:
                         last_order_status[pair] = None
 
-            # Kirim Dashboard: LANGSUNG DI DETIK PERTAMA, lalu tiap 15 menit
+            # Kirim Dashboard di awal dan rutin tiap 15 menit
             if (now - last_15m_report) >= 900:
                 dashboard = build_actionable_dashboard(data_cache)
                 send_telegram(dashboard)
