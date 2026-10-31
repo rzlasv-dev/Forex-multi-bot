@@ -22,18 +22,21 @@ CHECK_INTERVAL_SECONDS = 300    # Cek tiap 5 menit
 
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Peringatan: TELEGRAM_TOKEN atau TELEGRAM_CHAT_ID kosong!")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code != 200:
+            print(f"Gagal kirim Telegram: {res.text}")
     except Exception as e:
         print(f"Error Telegram: {e}")
 
 def is_forex_market_closed():
     """Pasar Forex tutup dari Jumat 22:00 UTC hingga Minggu 22:00 UTC"""
     now_utc = datetime.now(timezone.utc)
-    weekday = now_utc.weekday() # Senin=0 ... Jumat=4, Sabtu=5, Minggu=6
+    weekday = now_utc.weekday()  # Senin=0 ... Jumat=4, Sabtu=5, Minggu=6
     hour = now_utc.hour
     if weekday == 5:
         return True
@@ -80,7 +83,7 @@ def fetch_twelve_data(symbol):
         # EMA 50 untuk filter tren intraday
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
 
-        # Wilder's RSI 14 (Akurat sesuai TradingView/MT5)
+        # Wilder's RSI 14
         delta = df['close'].diff()
         gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
@@ -172,8 +175,8 @@ def generate_trade_setup(pair, df, cfg):
         entry_price = fvg_bot
         sl_price = max(struct_high, entry_price + (1.2 * atr)) + (0.3 * atr)
         risk = sl_price - entry_price
-        tp2_price = entry_price - (3.0 * risk)
         tp1_price = entry_price - (1.5 * risk)
+        tp2_price = entry_price - (3.0 * risk)
 
         in_fvg_zone = (fvg_bot - 0.1 * atr) <= live_close <= fvg_top
         order_type = "SELL NOW (In FVG) 🔴" if in_fvg_zone else "SELL LIMIT (FVG) 🔴"
@@ -223,17 +226,21 @@ def main():
     start_time = time.time()
     last_15m_report = 0
     last_order_status = {pair: None for pair in PORTFOLIO}
-    weekend_notified = False  # Penanda agar di hari libur tetap kirim 1x laporan awal
+    weekend_notified = False
 
     while (time.time() - start_time) < MAX_RUNTIME_SECONDS:
         try:
             if is_forex_market_closed():
                 if not weekend_notified:
-                    # Ambil 1x data penutupan Jumat untuk memastikan Telegram & API jalan
+                    print("Mengambil data penutupan akhir pekan untuk tes koneksi...")
                     data_cache = {pair: fetch_twelve_data(cfg["symbol"]) for pair, cfg in PORTFOLIO.items()}
                     dashboard = build_actionable_dashboard(data_cache)
                     if dashboard:
-                        send_telegram("⏸️ <b>MODE AKHIR PEKAN (PASAR TUTUP)</b>\n<i>Berikut posisi penutupan pasar terakhir:</i>\n\n" + dashboard)
+                        send_telegram(
+                            "⏸️ <b>MODE AKHIR PEKAN (PASAR TUTUP)</b>\n"
+                            "<i>Bot aktif! Berikut posisi penutupan pasar terakhir sebelum mode hemat kuota:</i>\n\n"
+                            + dashboard
+                        )
                     weekend_notified = True
                 print("Pasar Forex sedang tutup (Akhir Pekan). Tidur 15 menit...")
                 time.sleep(900)
@@ -242,3 +249,35 @@ def main():
             weekend_notified = False
             now = time.time()
             data_cache = {}
+
+            for pair, cfg in PORTFOLIO.items():
+                df = fetch_twelve_data(cfg["symbol"])
+                data_cache[pair] = df
+
+                if df is not None:
+                    setup = generate_trade_setup(pair, df, cfg)
+                    if "NOW" in setup['order'] and last_order_status[pair] != setup['order']:
+                        alert_msg = (
+                            f"🚨 <b>TRIGGER EXECUTION: {pair}</b> 🚨\n\n"
+                            f"Action: <code>{setup['order']}</code>\n"
+                            f"Live Entry: <code>{setup['entry']}</code>\n"
+                            f"SL: <code>{setup['sl']}</code> | TP1: <code>{setup['tp1']}</code>"
+                        )
+                        send_telegram(alert_msg)
+                        last_order_status[pair] = setup['order']
+                    elif "NOW" not in setup['order']:
+                        last_order_status[pair] = None
+
+            if (now - last_15m_report) >= 900:
+                dashboard = build_actionable_dashboard(data_cache)
+                if dashboard:
+                    send_telegram(dashboard)
+                    last_15m_report = now
+
+        except Exception as e:
+            print(f"Error loop utama: {e}")
+
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+if __name__ == "__main__":
+    main()
