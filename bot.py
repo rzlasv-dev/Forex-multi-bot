@@ -223,45 +223,22 @@ def main():
     start_time = time.time()
     last_15m_report = 0
     last_order_status = {pair: None for pair in PORTFOLIO}
+    weekend_notified = False  # Penanda agar di hari libur tetap kirim 1x laporan awal
 
     while (time.time() - start_time) < MAX_RUNTIME_SECONDS:
         try:
             if is_forex_market_closed():
+                if not weekend_notified:
+                    # Ambil 1x data penutupan Jumat untuk memastikan Telegram & API jalan
+                    data_cache = {pair: fetch_twelve_data(cfg["symbol"]) for pair, cfg in PORTFOLIO.items()}
+                    dashboard = build_actionable_dashboard(data_cache)
+                    if dashboard:
+                        send_telegram("⏸️ <b>MODE AKHIR PEKAN (PASAR TUTUP)</b>\n<i>Berikut posisi penutupan pasar terakhir:</i>\n\n" + dashboard)
+                    weekend_notified = True
                 print("Pasar Forex sedang tutup (Akhir Pekan). Tidur 15 menit...")
                 time.sleep(900)
                 continue
 
+            weekend_notified = False
             now = time.time()
             data_cache = {}
-
-            for pair, cfg in PORTFOLIO.items():
-                df = fetch_twelve_data(cfg["symbol"])
-                data_cache[pair] = df
-
-                if df is not None:
-                    setup = generate_trade_setup(pair, df, cfg)
-                    if "NOW" in setup['order'] and last_order_status[pair] != setup['order']:
-                        alert_msg = (
-                            f"🚨 <b>TRIGGER EXECUTION: {pair}</b> 🚨\n\n"
-                            f"Action: <code>{setup['order']}</code>\n"
-                            f"Live Entry: <code>{setup['entry']}</code>\n"
-                            f"SL: <code>{setup['sl']}</code> | TP1: <code>{setup['tp1']}</code>"
-                        )
-                        send_telegram(alert_msg)
-                        last_order_status[pair] = setup['order']
-                    elif "NOW" not in setup['order']:
-                        last_order_status[pair] = None
-
-            if (now - last_15m_report) >= 900:
-                dashboard = build_actionable_dashboard(data_cache)
-                if dashboard:
-                    send_telegram(dashboard)
-                    last_15m_report = now
-
-        except Exception as e:
-            print(f"Error loop utama: {e}")
-
-        time.sleep(CHECK_INTERVAL_SECONDS)
-
-if __name__ == "__main__":
-    main()
