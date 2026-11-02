@@ -1,44 +1,70 @@
 import time
 import os
+import html
 import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-# ----------------- KONFIGURASI -----------------
+# ----------------- KONFIGURASI UTAMA -----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
+WIB_TZ = ZoneInfo("Asia/Jakarta")
+
 PORTFOLIO = {
-    "XAU/USD": {"symbol": "XAU/USD", "pip": 0.1, "digits": 2, "name": "GOLD (Spot Exness)"},
+    "XAU/USD": {"symbol": "XAU/USD", "pip": 0.1, "digits": 2, "name": "GOLD (Spot)"},
     "EUR/USD": {"symbol": "EUR/USD", "pip": 0.0001, "digits": 5, "name": "EUR/USD"},
     "USD/JPY": {"symbol": "USD/JPY", "pip": 0.01, "digits": 3, "name": "USD/JPY"}
 }
 
 TIMEFRAME = "15min"
-MAX_RUNTIME_SECONDS = 330 * 60       # 5.5 jam relay GitHub Actions
-ACTIVE_CHECK_INTERVAL = 300          # Cek tiap 5 menit saat sesi aktif
+OUTPUTSIZE = 400                     # 400 candle 15m = 100 jam (cukup untuk 1H tanpa ekstra API call)
+MAX_RUNTIME_SECONDS = 330 * 60       # 5.5 jam (19.800 detik) agar aman sebelum timeout 360 menit YAML
+ACTIVE_CHECK_INTERVAL = 300          # Cek tiap 5 menit saat Tokyo/London/NY
 OFFHOURS_CHECK_INTERVAL = 900        # Cek tiap 15 menit saat Sydney/Off-hours (Hemat Kuota API)
+
+# Gunakan Session untuk efisiensi koneksi TCP/TLS
+HTTP_SESSION = requests.Session()
+
+
+# ----------------- UTILITAS KEAMANAN & TELEGRAM -----------------
+def sanitize_log(text: str) -> str:
+    """Menyensor kredensial sensitif agar tidak pernah bocor ke log publik GitHub Actions"""
+    safe_text = str(text)
+    for secret in (TWELVE_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID):
+        if secret:
+            safe_text = safe_text.replace(secret, "***REDACTED***")
+    return safe_text
 
 
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Peringatan: TELEGRAM_TOKEN atau TELEGRAM_CHAT_ID kosong!")
+        print("Peringatan: TELEGRAM_TOKEN atau TELEGRAM_CHAT_ID belum diset di Secrets!")
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message[:4090],  # Proteksi batas 4096 karakter Telegram
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        res = HTTP_SESSION.post(url, json=payload, timeout=12)
         if res.status_code != 200:
-            print(f"Gagal kirim Telegram: {res.text}")
+            print(f"Gagal kirim Telegram (HTTP {res.status_code}): {sanitize_log(res.text)}")
     except Exception as e:
-        print(f"Error Telegram: {e}")
+        print(f"Error koneksi Telegram: {sanitize_log(e)}")
 
 
-def is_forex_market_closed():
-    """Pasar Forex tutup dari Jumat 22:00 UTC hingga Minggu 22:00 UTC"""
-    now_utc = datetime.now(timezone.utc)
+# ----------------- MANAJEMEN WAKTU & SESI MARKET -----------------
+def is_forex_market_closed(now_utc: datetime = None) -> bool:
+    """Pasar Forex tutup dari Jumat 22:00 UTC (Sabtu 05:00 WIB) s/d Minggu 22:00 UTC (Senin 05:00 WIB)"""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
     weekday = now_utc.weekday()
     hour = now_utc.hour
     if weekday == 5:
@@ -50,8 +76,10 @@ def is_forex_market_closed():
     return False
 
 
-def get_current_session():
-    hour = datetime.now(timezone.utc).hour
+def get_current_session(now_utc: datetime = None) -> str:
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    hour = now_utc.hour
     sessions = []
     if 0 <= hour < 9:
         sessions.append("Tokyo 🇯🇵")
@@ -62,14 +90,17 @@ def get_current_session():
     return " + ".join(sessions) if sessions else "Sydney/Off-hours 🇦🇺"
 
 
-def is_in_ict_killzone():
+def is_in_ict_killzone(now_utc: datetime = None) -> bool:
     """Validasi ICT Killzone: London Open (07:00-10:00 UTC) & NY Open (12:00-16:00 UTC)"""
-    hour = datetime.now(timezone.utc).hour
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    hour = now_utc.hour
     return (7 <= hour <= 10) or (12 <= hour <= 16)
 
 
-def add_indicators(df):
-    """Menghitung EMA 50, Wilder's RSI 14, dan Wilder's ATR 14 pada DataFrame OHLC"""
+# ----------------- DATA FETCHING & INDIKATOR -----------------
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Menghitung EMA 50, Wilder's RSI 14, dan Wilder's ATR 14"""
     df = df.copy()
     df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
 
@@ -83,12 +114,12 @@ def add_indicators(df):
     hc = (df['high'] - df['close'].shift()).abs()
     lc = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    df['atr'] = tr.ewm(alpha=1/14, adjust=False).mean()
+    df['atr'] = tr.ewm(alpha=1/14, adjust=False).mean().bfill()
     return df
 
 
-def fetch_twelve_data(symbol):
-    """Mengambil 400 candle 15m (setara 100 candle 1H) dengan 1 kredit API"""
+def fetch_twelve_data(symbol: str):
+    """Mengambil 400 candle 15m dalam zona waktu UTC murni"""
     if not TWELVE_API_KEY:
         print("Error: TWELVE_API_KEY belum diset di GitHub Secrets!")
         return None
@@ -97,176 +128,274 @@ def fetch_twelve_data(symbol):
     params = {
         "symbol": symbol,
         "interval": TIMEFRAME,
-        "outputsize": 400,  # 400 candle 15m = 100 jam (Cukup untuk struktur 1H tanpa ekstra API call)
+        "outputsize": OUTPUTSIZE,
+        "timezone": "UTC",  # Kunci di UTC agar resampling 1H dan Killzone 100% akurat
         "apikey": TWELVE_API_KEY
     }
     try:
-        res = requests.get(url, params=params, timeout=10).json()
+        resp = HTTP_SESSION.get(url, params=params, timeout=15)
+        res = resp.json()
         if "values" not in res:
-            print(f"Error Twelve Data ({symbol}): {res.get('message')}")
+            err_msg = res.get("message", "Unknown API response")
+            print(f"Error Twelve Data ({symbol}): {sanitize_log(err_msg)}")
             return None
 
         df = pd.DataFrame(res["values"]).iloc[::-1].reset_index(drop=True)
-        df['datetime'] = pd.to_datetime(df['datetime'])
+        df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
         for col in ['open', 'high', 'low', 'close']:
-            df[col] = df[col].astype(float)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        df = df.dropna(subset=['open', 'high', 'low', 'close']).reset_index(drop=True)
+        if len(df) < 80:
+            print(f"Data {symbol} terlalu sedikit ({len(df)} baris).")
+            return None
 
         return add_indicators(df)
     except Exception as e:
-        print(f"Gagal mengambil {symbol}: {e}")
+        print(f"Gagal mengambil {symbol}: {sanitize_log(e)}")
         return None
 
 
-def resample_to_1h(df_15m):
-    """Merakit DataFrame 1H (HTF) langsung dari data 15m (Zero Extra API Call)"""
+def resample_to_1h(df_15m: pd.DataFrame) -> pd.DataFrame:
+    """Merakit DataFrame 1H (HTF) utuh tanpa partial candle di ujung awal"""
     df_htf = (
         df_15m.set_index('datetime')
         .resample('1h')
-        .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'})
-        .dropna()
-        .reset_index()
+        .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'close_count': ('close', 'count')})
     )
+    # Fix Partial First Candle: Jika candle 1H paling kiri tidak dimulai dari menit :00 (kurang dari 4 bar M15), buang
+    if len(df_htf) > 2 and df_15m.iloc[0]['datetime'].minute != 0:
+        df_htf = df_htf.iloc[1:]
+
+    df_htf = df_htf.dropna(subset=['open', 'high', 'low', 'close']).reset_index()
     return add_indicators(df_htf)
 
 
-def find_fractals(df, left=2, right=2):
-    """Mendeteksi Swing High dan Swing Low berbasis 5-bar Fractal"""
+# ----------------- ALGORITMA SMC & ICT -----------------
+def find_fractals(df: pd.DataFrame, left: int = 2, right: int = 2):
+    """Mendeteksi Swing High dan Swing Low berbasis 5-bar Williams Fractal"""
     swing_highs = []
     swing_lows = []
+    highs = df['high'].values
+    lows = df['low'].values
+
     for i in range(left, len(df) - right):
-        is_high = all(df.iloc[i]['high'] > df.iloc[i - j]['high'] for j in range(1, left + 1)) and \
-                  all(df.iloc[i]['high'] >= df.iloc[i + j]['high'] for j in range(1, right + 1))
-        is_low = all(df.iloc[i]['low'] < df.iloc[i - j]['low'] for j in range(1, left + 1)) and \
-                 all(df.iloc[i]['low'] <= df.iloc[i + j]['low'] for j in range(1, right + 1))
+        is_high = all(highs[i] > highs[i - j] for j in range(1, left + 1)) and \
+                  all(highs[i] >= highs[i + j] for j in range(1, right + 1))
+        is_low = all(lows[i] < lows[i - j] for j in range(1, left + 1)) and \
+                 all(lows[i] <= lows[i + j] for j in range(1, right + 1))
         if is_high:
-            swing_highs.append((i, df.iloc[i]['high']))
+            swing_highs.append((i, float(highs[i])))
         if is_low:
-            swing_lows.append((i, df.iloc[i]['low']))
+            swing_lows.append((i, float(lows[i])))
     return swing_highs, swing_lows
 
 
-def analyze_htf_1h(df_15m):
-    """Menganalisa Struktur 1H, Dealing Range (Premium/Discount), dan Liquidity Sweep"""
-    df_1h = resample_to_1h(df_15m)
-    closed_1h = df_1h.iloc[:-1].copy()
+def extract_valid_dealing_range(df_closed: pd.DataFrame, sh_list: list, sl_list: list):
+    """Memastikan Dealing Range selalu valid (Swing High > Swing Low) dan tidak terbalik"""
+    if not sh_list or not sl_list:
+        return None, None, None, None
 
-    if len(closed_1h) < 30:
-        return {"bias": "NEUTRAL", "zone": "EQ", "sh": None, "sl": None, "eq": None, "poi_active": False}
+    sh_idx, sh_val = sh_list[-1]
+    sl_idx, sl_val = sl_list[-1]
+    atr = df_closed.iloc[-1]['atr']
+
+    # Jika fractal terakhir tidak valid (sh_val <= sl_val) atau terlalu sempit (< 0.8 ATR),
+    # cari pasangan ekstrem dari 40 candle terakhir sebagai anchor Dealing Range
+    if sh_val <= sl_val or (sh_val - sl_val) < (0.8 * atr):
+        window = df_closed.iloc[-40:]
+        sh_idx = int(window['high'].idxmax())
+        sl_idx = int(window['low'].idxmin())
+        sh_val = float(df_closed.loc[sh_idx, 'high'])
+        sl_val = float(df_closed.loc[sl_idx, 'low'])
+
+    if sh_val <= sl_val:
+        return None, None, None, None
+
+    return sh_idx, sh_val, sl_idx, sl_val
+
+
+def analyze_htf_1h(df_15m: pd.DataFrame):
+    """Menganalisa Struktur 1H, Dealing Range (Premium/Discount), dan Liquidity Sweep dengan hierarki ketat"""
+    df_1h = resample_to_1h(df_15m)
+    closed_1h = df_1h.iloc[:-1].copy().reset_index(drop=True)
+
+    if len(closed_1h) < 25:
+        return {"bias": "NEUTRAL", "zone": "EQ", "sh": None, "sl": None, "eq": None}
 
     sh_list, sl_list = find_fractals(closed_1h, left=2, right=2)
-    if not sh_list or not sl_list:
-        return {"bias": "NEUTRAL", "zone": "EQ", "sh": None, "sl": None, "eq": None, "poi_active": False}
+    _, htf_sh, _, htf_sl = extract_valid_dealing_range(closed_1h, sh_list, sl_list)
 
-    _, htf_sh = sh_list[-1]
-    _, htf_sl = sl_list[-1]
+    if htf_sh is None or htf_sl is None:
+        return {"bias": "NEUTRAL", "zone": "EQ", "sh": None, "sl": None, "eq": None}
+
     htf_eq = (htf_sh + htf_sl) / 2.0
-
     last_1h = closed_1h.iloc[-1]
-    live_price = df_15m.iloc[-1]['close']
+    live_price = float(df_15m.iloc[-1]['close'])
     recent_1h = closed_1h.iloc[-4:]
 
-    # Zona Dealing Range 1H
     zone = "DISCOUNT" if live_price <= htf_eq else "PREMIUM"
 
-    # Deteksi 1H BOS atau 1H Liquidity Sweep (Turtle Soup)
+    # Deteksi 1H Liquidity Sweep (Turtle Soup) & Break of Structure (BOS)
     htf_swept_ssl = (recent_1h['low'] < htf_sl).any() and (last_1h['close'] > htf_sl)
     htf_swept_bsl = (recent_1h['high'] > htf_sh).any() and (last_1h['close'] < htf_sh)
 
-    htf_bull_bos = (recent_1h['close'] > htf_sh).any() or (last_1h['close'] > last_1h['ema_50'])
-    htf_bear_bos = (recent_1h['close'] < htf_sl).any() or (last_1h['close'] < last_1h['ema_50'])
+    htf_bull_bos = last_1h['close'] > htf_sh
+    htf_bear_bos = last_1h['close'] < htf_sl
 
-    bias = "NEUTRAL"
-    if htf_swept_ssl or htf_bull_bos:
+    # Hierarki Prioritas Tanpa Tabrakan (Sweep > Pure BOS > EMA50 Structure)
+    if htf_swept_ssl and not htf_swept_bsl:
         bias = "BULLISH"
-    elif htf_swept_bsl or htf_bear_bos:
+    elif htf_swept_bsl and not htf_swept_ssl:
         bias = "BEARISH"
+    elif htf_bull_bos:
+        bias = "BULLISH"
+    elif htf_bear_bos:
+        bias = "BEARISH"
+    elif last_1h['close'] > last_1h['ema_50']:
+        bias = "BULLISH"
+    elif last_1h['close'] < last_1h['ema_50']:
+        bias = "BEARISH"
+    else:
+        bias = "NEUTRAL"
 
     return {
         "bias": bias,
         "zone": zone,
         "sh": htf_sh,
         "sl": htf_sl,
-        "eq": htf_eq,
-        "swept_liquidity": htf_swept_ssl or htf_swept_bsl
+        "eq": htf_eq
     }
 
 
-def generate_trade_setup(pair, df, cfg):
+def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
     digits = cfg["digits"]
     live_candle = df.iloc[-1]
-    live_close = live_candle['close']
-    live_low = live_candle['low']
-    live_high = live_candle['high']
+    live_close = float(live_candle['close'])
+    live_low = float(live_candle['low'])
+    live_high = float(live_candle['high'])
 
     # 1. Analisa Bias Higher Timeframe (1H)
     htf = analyze_htf_1h(df)
     htf_bias = htf["bias"]
     htf_zone = htf["zone"]
+    htf_summary = f"1H: {htf_bias} ({htf_zone})"
 
     # 2. Evaluasi Struktur Lower Timeframe (15M) pada candle yang sudah close
-    closed_df = df.iloc[:-1].copy()
+    closed_df = df.iloc[:-1].copy().reset_index(drop=True)
     last_closed = closed_df.iloc[-1]
-    atr = last_closed['atr']
-    ema50 = last_closed['ema_50']
+    atr = float(last_closed['atr'])
+    ema50 = float(last_closed['ema_50'])
 
-    sh_15m, sl_15m = find_fractals(closed_df.iloc[-60:], left=2, right=2)
-    if not sh_15m or not sl_15m:
+    lookback_df = closed_df.iloc[-60:].reset_index(drop=True)
+    sh_15m, sl_15m = find_fractals(lookback_df, left=2, right=2)
+    _, swing_high, _, swing_low = extract_valid_dealing_range(lookback_df, sh_15m, sl_15m)
+
+    if swing_high is None or swing_low is None:
         return {
             "order": "WAIT / NO SETUP ⚪",
             "entry": f"{live_close:.{digits}f}",
             "sl": "-", "tp1": "-", "tp2": "-",
             "setup_id": None,
-            "htf_info": f"1H {htf_bias} ({htf_zone})",
-            "note": "Menunggu pembentukan struktur Fractal 15M."
+            "stage": "NONE",
+            "htf_info": htf_summary,
+            "note": "Menunggu pembentukan struktur Dealing Range 15M."
         }
 
-    _, swing_high = sh_15m[-1]
-    _, swing_low = sl_15m[-1]
     eq_15m = (swing_high + swing_low) / 2.0
 
-    # 3. Konfirmasi 15M BOS / Liquidity Sweep
-    recent_5 = closed_df.iloc[-5:]
-    swept_ssl_15m = (closed_df.iloc[-8:]['low'] < swing_low).any() and (last_closed['close'] > swing_low)
-    swept_bsl_15m = (closed_df.iloc[-8:]['high'] > swing_high).any() and (last_closed['close'] < swing_high)
+    # 3. Konfirmasi 15M MSS (BOS / Liquidity Sweep) beserta indeks kronologisnya
+    recent_8 = closed_df.iloc[-8:]
+    swept_ssl_mask = recent_8['low'] < swing_low
+    swept_bsl_mask = recent_8['high'] > swing_high
 
-    bullish_mss = ((recent_5['close'] > swing_high).any() or swept_ssl_15m) and (last_closed['close'] > ema50)
-    bearish_mss = ((recent_5['close'] < swing_low).any() or swept_bsl_15m) and (last_closed['close'] < ema50)
+    swept_ssl_15m = swept_ssl_mask.any() and (last_closed['close'] > swing_low)
+    swept_bsl_15m = swept_bsl_mask.any() and (last_closed['close'] < swing_high)
 
-    # 4. Deteksi Unmitigated FVG 15M dengan Validasi Displacement & Consequent Encroachment (50% CE)
+    bos_bull_mask = closed_df.iloc[-6:]['close'] > swing_high
+    bos_bear_mask = closed_df.iloc[-6:]['close'] < swing_low
+
+    bullish_mss = (bos_bull_mask.any() or swept_ssl_15m) and (last_closed['close'] > ema50)
+    bearish_mss = (bos_bear_mask.any() or swept_bsl_15m) and (last_closed['close'] < ema50)
+
+    # Titik awal kaki impulsif agar FVG yang diambil tidak mendahului sweep ekstrem
+    bull_origin_idx = int(recent_8['low'].idxmin())
+    bear_origin_idx = int(recent_8['high'].idxmax())
+
+    # 4. Deteksi Unmitigated & Unviolated FVG 15M
     bull_fvg = None
     bear_fvg = None
 
-    for i in range(len(closed_df) - 8, len(closed_df) - 2):
+    start_scan = max(0, len(closed_df) - 9)
+    end_scan = len(closed_df) - 2
+
+    for i in range(start_scan, end_scan):
         c1 = closed_df.iloc[i]
         c2 = closed_df.iloc[i + 1]
         c3 = closed_df.iloc[i + 2]
 
         c2_body = abs(c2['close'] - c2['open'])
-        is_displacement = c2_body > (0.45 * atr)
-        after_fvg = df.iloc[i + 3:]  # Mencakup candle live agar FVG yang jebol langsung gugur
+        is_displacement = c2_body > (0.40 * atr)
 
-        # Bullish FVG
-        if is_displacement and (c3['low'] - c1['high']) > (0.15 * atr):
-            ce_bull = (c1['high'] + c3['low']) / 2.0
-            if (after_fvg['low'] > ce_bull).all():
-                fvg_time = c2['datetime'].strftime('%Y%m%d_%H%M')
-                bull_fvg = (c1['high'], c3['low'], ce_bull, min(c1['low'], c2['low']), fvg_time)
+        # Candle yang sudah tutup setelah FVG selesai terbentuk (c3 adalah i+2, jadi setelahnya adalah i+3)
+        after_closed = closed_df.iloc[i + 3:]
 
-        # Bearish FVG
-        if is_displacement and (c1['low'] - c3['high']) > (0.15 * atr):
-            ce_bear = (c3['high'] + c1['low']) / 2.0
-            if (after_fvg['high'] < ce_bear).all():
+        # --- Evaluasi Bullish FVG ---
+        if (i + 1) >= bull_origin_idx and is_displacement and (c3['low'] - c1['high']) > (0.12 * atr):
+            fvg_bot = float(c1['high'])
+            fvg_top = float(c3['low'])
+            ce_bull = (fvg_bot + fvg_top) / 2.0
+            ob_low = float(min(c1['low'], c2['low']))
+            planned_entry = fvg_top if fvg_top <= eq_15m else ce_bull
+
+            # Syarat 1 (Unviolated): Belum ada candle close di bawah fvg_bot & belum menyentuh SL (ob_low)
+            unviolated = True
+            already_used = False
+
+            if len(after_closed) > 0:
+                if (after_closed['close'] < fvg_bot).any() or (after_closed['low'] <= ob_low).any():
+                    unviolated = False
+                # Syarat 2 (Freshness): Jika candle lama (selain 1 candle terakhir) sudah menyentuh entry lalu lari > 1 ATR, FVG sudah terpakai
+                older_closed = after_closed.iloc[:-1]
+                if len(older_closed) > 0 and (older_closed['low'] <= planned_entry).any():
+                    if (after_closed['high'] >= planned_entry + atr).any():
+                        already_used = True
+
+            # Cek juga apakah candle live saat ini sudah menjebol titik SL
+            if unviolated and not already_used and (live_low > ob_low):
                 fvg_time = c2['datetime'].strftime('%Y%m%d_%H%M')
-                bear_fvg = (c3['high'], c1['low'], ce_bear, max(c1['high'], c2['high']), fvg_time)
+                bull_fvg = (fvg_bot, fvg_top, ce_bull, ob_low, fvg_time)
+
+        # --- Evaluasi Bearish FVG ---
+        if (i + 1) >= bear_origin_idx and is_displacement and (c1['low'] - c3['high']) > (0.12 * atr):
+            fvg_bot = float(c3['high'])
+            fvg_top = float(c1['low'])
+            ce_bear = (fvg_bot + fvg_top) / 2.0
+            ob_high = float(max(c1['high'], c2['high']))
+            planned_entry = fvg_bot if fvg_bot >= eq_15m else ce_bear
+
+            unviolated = True
+            already_used = False
+
+            if len(after_closed) > 0:
+                if (after_closed['close'] > fvg_top).any() or (after_closed['high'] >= ob_high).any():
+                    unviolated = False
+                older_closed = after_closed.iloc[:-1]
+                if len(older_closed) > 0 and (older_closed['high'] >= planned_entry).any():
+                    if (after_closed['low'] <= planned_entry - atr).any():
+                        already_used = True
+
+            if unviolated and not already_used and (live_high < ob_high):
+                fvg_time = c2['datetime'].strftime('%Y%m%d_%H%M')
+                bear_fvg = (fvg_bot, fvg_top, ce_bear, ob_high, fvg_time)
 
     in_kz = is_in_ict_killzone()
-    htf_summary = f"1H: {htf_bias} ({htf_zone})"
-
     setup = {
         "order": "WAIT / NO SETUP ⚪",
         "entry": f"{live_close:.{digits}f}",
         "sl": "-", "tp1": "-", "tp2": "-",
         "setup_id": None,
+        "stage": "NONE",
         "htf_info": htf_summary,
         "note": f"15M Range: {swing_low:.{digits}f} - {swing_high:.{digits}f}"
     }
@@ -280,15 +409,26 @@ def generate_trade_setup(pair, df, cfg):
 
         if risk > 0:
             tp1_price = max(swing_high, entry_price + (1.5 * risk))
-            # Gunakan 1H Swing High sebagai Draw on Liquidity (TP2) jika memberikan RR >= 2.5
             htf_dol = htf["sh"] if (htf["sh"] and htf["sh"] >= entry_price + (2.5 * risk)) else (entry_price + (3.0 * risk))
             tp2_price = htf_dol
 
             is_aplus = (htf_zone == "DISCOUNT") and in_kz
             grade = " [A+ ICT 🔥]" if is_aplus else " [B-Grade ⚠️]"
 
-            in_fvg_zone = (fvg_bot <= live_low <= (fvg_top + 0.05 * atr)) and (live_close > sl_price)
-            order_type = f"BUY NOW (In FVG) 🟢{grade}" if in_fvg_zone else f"BUY LIMIT (FVG) 🟢{grade}"
+            # Deteksi apakah harga saat ini sedang berada di dalam zona FVG atau baru menyentuhnya di candle terakhir
+            in_fvg_zone = (
+                (fvg_bot - 0.05 * atr <= live_low <= fvg_top + 0.05 * atr)
+                or (fvg_bot <= last_closed['low'] <= fvg_top and live_close <= entry_price + 0.3 * atr)
+            ) and (live_close > sl_price)
+
+            if in_fvg_zone:
+                order_type = f"BUY NOW (In FVG) 🟢{grade}"
+                stage = "NOW"
+            elif live_close > fvg_top:
+                order_type = f"BUY LIMIT (FVG) 🟢{grade}"
+                stage = "LIMIT"
+            else:
+                return setup  # Harga sudah tembus jauh di bawah FVG
 
             setup = {
                 "order": order_type,
@@ -296,7 +436,8 @@ def generate_trade_setup(pair, df, cfg):
                 "sl": f"{sl_price:.{digits}f}",
                 "tp1": f"{tp1_price:.{digits}f}",
                 "tp2": f"{tp2_price:.{digits}f}",
-                "setup_id": f"{pair}_BULL_{fvg_id}",
+                "setup_id": f"{pair}_BULL_{fvg_id}_{stage}",
+                "stage": stage,
                 "htf_info": htf_summary,
                 "note": f"1H Bullish + 15M FVG ({fvg_bot:.{digits}f}-{fvg_top:.{digits}f})"
             }
@@ -316,8 +457,19 @@ def generate_trade_setup(pair, df, cfg):
             is_aplus = (htf_zone == "PREMIUM") and in_kz
             grade = " [A+ ICT 🔥]" if is_aplus else " [B-Grade ⚠️]"
 
-            in_fvg_zone = ((fvg_bot - 0.05 * atr) <= live_high <= fvg_top) and (live_close < sl_price)
-            order_type = f"SELL NOW (In FVG) 🔴{grade}" if in_fvg_zone else f"SELL LIMIT (FVG) 🔴{grade}"
+            in_fvg_zone = (
+                (fvg_bot - 0.05 * atr <= live_high <= fvg_top + 0.05 * atr)
+                or (fvg_bot <= last_closed['high'] <= fvg_top and live_close >= entry_price - 0.3 * atr)
+            ) and (live_close < sl_price)
+
+            if in_fvg_zone:
+                order_type = f"SELL NOW (In FVG) 🔴{grade}"
+                stage = "NOW"
+            elif live_close < fvg_bot:
+                order_type = f"SELL LIMIT (FVG) 🔴{grade}"
+                stage = "LIMIT"
+            else:
+                return setup
 
             setup = {
                 "order": order_type,
@@ -325,7 +477,8 @@ def generate_trade_setup(pair, df, cfg):
                 "sl": f"{sl_price:.{digits}f}",
                 "tp1": f"{tp1_price:.{digits}f}",
                 "tp2": f"{tp2_price:.{digits}f}",
-                "setup_id": f"{pair}_BEAR_{fvg_id}",
+                "setup_id": f"{pair}_BEAR_{fvg_id}_{stage}",
+                "stage": stage,
                 "htf_info": htf_summary,
                 "note": f"1H Bearish + 15M FVG ({fvg_bot:.{digits}f}-{fvg_top:.{digits}f})"
             }
@@ -333,101 +486,158 @@ def generate_trade_setup(pair, df, cfg):
     return setup
 
 
-def build_actionable_dashboard(data_dict):
+# ----------------- FORMATTER DASHBOARD & SINYAL -----------------
+def build_actionable_dashboard(data_dict: dict, setups_cache: dict):
     valid_pairs = {k: v for k, v in data_dict.items() if v is not None}
     if not valid_pairs:
         return None
 
-    session = get_current_session()
-    kz_status = "ACTIVE 🔥" if is_in_ict_killzone() else "INACTIVE 💤"
-    utc_time = datetime.now(timezone.utc).strftime('%H:%M:%S')
+    now_utc = datetime.now(timezone.utc)
+    now_wib = now_utc.astimezone(WIB_TZ)
+    session = get_current_session(now_utc)
+    kz_status = "ACTIVE 🔥" if is_in_ict_killzone(now_utc) else "INACTIVE 💤"
 
-    msg = f"⚡ <b>ICT & SMC MTF ACTION PLAN (1H ➔ 15M)</b> ⚡\n"
+    msg = "⚡ <b>ICT &amp; SMC 3-HOURLY MARKET OUTLOOK (1H ➔ 15M)</b> ⚡\n"
     msg += f"Sesi: <b>{session}</b> | Killzone: <b>{kz_status}</b>\n"
-    msg += f"Waktu Server: <code>{utc_time} UTC</code>\n"
+    msg += f"Waktu: <code>{now_wib.strftime('%H:%M')} WIB</code> (<code>{now_utc.strftime('%H:%M')} UTC</code>)\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
     for pair, df in valid_pairs.items():
         cfg = PORTFOLIO[pair]
         curr = df.iloc[-1]
-        setup = generate_trade_setup(pair, df, cfg)
+        setup = setups_cache.get(pair) or generate_trade_setup(pair, df, cfg)
         digits = cfg["digits"]
+        safe_note = html.escape(str(setup['note']))
 
         msg += f"🎯 <b>{pair}</b> | Live Spot: <code>{curr['close']:.{digits}f}</code>\n"
-        msg += f"• <b>HTF Bias:</b> <code>{setup['htf_info']}</code>\n"
-        msg += f"• <b>Order:</b> <code>{setup['order']}</code>\n"
+        msg += f"• <b>HTF Bias:</b> <code>{html.escape(setup['htf_info'])}</code>\n"
+        msg += f"• <b>Status:</b> <code>{html.escape(setup['order'])}</code>\n"
         msg += f"• <b>Entry:</b> <code>{setup['entry']}</code>\n"
         msg += f"• <b>Stop Loss (SL):</b> <code>{setup['sl']}</code>\n"
         msg += f"• <b>TP1 (Internal):</b> <code>{setup['tp1']}</code>\n"
         msg += f"• <b>TP2 (1H DOL):</b> <code>{setup['tp2']}</code>\n"
-        msg += f"• <b>Kondisi:</b> RSI <code>{curr['rsi']:.1f}</code> | <i>{setup['note']}</i>\n"
+        msg += f"• <b>Kondisi:</b> RSI <code>{curr['rsi']:.1f}</code> | <i>{safe_note}</i>\n"
         msg += "──────────────────────\n"
 
-    msg += "<i>Engine: 1H Dealing Range + 15M Fractal MSS + Displacement FVG</i>"
+    msg += "<i>Engine: 1H Dealing Range + 15M Fractal MSS + Unmitigated FVG</i>"
     return msg
 
 
+# ----------------- ENGINE LOOP UTAMA (5.5 HOURS RELAY) -----------------
 def main():
     start_time = time.time()
-    last_15m_report = 0
-    triggered_setups = {pair: None for pair in PORTFOLIO}
+    triggered_setups = set()
     weekend_notified = False
+
+    # Zero-State Relay Synchronization untuk Laporan 3 Jam:
+    # Blok 3 jam dihitung berdasarkan (Tanggal UTC, Jam UTC // 3) -> 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 UTC
+    # Jika runner baru menyala di tengah blok (bukan di 16 menit pertama jam kelipatan 3),
+    # tandai blok saat ini sudah terkirim agar pergantian estafet runner tidak memicu spam laporan.
+    init_utc = datetime.now(timezone.utc)
+    init_block = (init_utc.date(), init_utc.hour // 3)
+    if init_utc.hour % 3 == 0 and init_utc.minute < 16:
+        last_reported_block = None
+    else:
+        last_reported_block = init_block
+
+    print(
+        f"Engine dimulai pada {init_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC. "
+        f"Batas Relay: {MAX_RUNTIME_SECONDS // 60} menit."
+    )
 
     while (time.time() - start_time) < MAX_RUNTIME_SECONDS:
         try:
-            if is_forex_market_closed():
+            now_utc = datetime.now(timezone.utc)
+
+            # 1. Mode Akhir Pekan (Hemat Kuota API)
+            if is_forex_market_closed(now_utc):
                 if not weekend_notified:
-                    print("Mengambil data penutupan akhir pekan untuk tes koneksi...")
-                    data_cache = {pair: fetch_twelve_data(cfg["symbol"]) for pair, cfg in PORTFOLIO.items()}
-                    dashboard = build_actionable_dashboard(data_cache)
+                    print("Pasar tutup (Akhir Pekan). Mengambil snapshot penutupan...")
+                    data_cache = {}
+                    setups_cache = {}
+                    for pair, cfg in PORTFOLIO.items():
+                        df = fetch_twelve_data(cfg["symbol"])
+                        data_cache[pair] = df
+                        if df is not None:
+                            setups_cache[pair] = generate_trade_setup(pair, df, cfg)
+
+                    dashboard = build_actionable_dashboard(data_cache, setups_cache)
                     if dashboard:
                         send_telegram(
                             "⏸️ <b>MODE AKHIR PEKAN (PASAR TUTUP)</b>\n"
-                            "<i>Bot aktif! Berikut posisi penutupan pasar terakhir sebelum mode hemat kuota:</i>\n\n"
+                            "<i>Berikut posisi penutupan pasar terakhir sebelum mode hemat kuota:</i>\n\n"
                             + dashboard
                         )
                     weekend_notified = True
-                print("Pasar Forex sedang tutup (Akhir Pekan). Tidur 15 menit...")
-                time.sleep(900)
+
+                remaining = MAX_RUNTIME_SECONDS - (time.time() - start_time)
+                if remaining <= 0:
+                    break
+                print("Pasar Forex sedang tutup. Tidur 15 menit...")
+                time.sleep(min(OFFHOURS_CHECK_INTERVAL, remaining))
                 continue
 
             weekend_notified = False
-            now = time.time()
             data_cache = {}
+            setups_cache = {}
 
+            # 2. Pemindaian Market & Deteksi Setup Instan (Prioritas Utama)
             for pair, cfg in PORTFOLIO.items():
                 df = fetch_twelve_data(cfg["symbol"])
                 data_cache[pair] = df
 
                 if df is not None:
                     setup = generate_trade_setup(pair, df, cfg)
-                    # Cegah spam notifikasi untuk FVG yang sama dengan melacak setup_id unik
-                    if "NOW" in setup['order'] and setup['setup_id'] and triggered_setups[pair] != setup['setup_id']:
+                    setups_cache[pair] = setup
+
+                    # Kirim sinyal INSTAN kapan saja jika ada Setup Valid (baik LIMIT baru maupun eksekusi NOW)
+                    setup_id = setup.get("setup_id")
+                    if setup_id and setup_id not in triggered_setups:
+                        now_wib = now_utc.astimezone(WIB_TZ)
+                        header = (
+                            f"🚨 <b>ICT INSTANT EXECUTION: {pair}</b> 🚨"
+                            if setup["stage"] == "NOW"
+                            else f"📌 <b>ICT NEW FVG SETUP (LIMIT): {pair}</b> 📌"
+                        )
                         alert_msg = (
-                            f"🚨 <b>ICT TRIGGER EXECUTION: {pair}</b> 🚨\n\n"
-                            f"HTF Context: <code>{setup['htf_info']}</code>\n"
-                            f"Action: <code>{setup['order']}</code>\n"
-                            f"Entry: <code>{setup['entry']}</code>\n"
-                            f"SL: <code>{setup['sl']}</code>\n"
-                            f"TP1: <code>{setup['tp1']}</code> | TP2 (DOL): <code>{setup['tp2']}</code>\n"
-                            f"Note: <i>{setup['note']}</i>"
+                            f"{header}\n"
+                            f"Waktu: <code>{now_wib.strftime('%H:%M')} WIB</code> (<code>{now_utc.strftime('%H:%M')} UTC</code>)\n\n"
+                            f"• <b>HTF Context:</b> <code>{html.escape(setup['htf_info'])}</code>\n"
+                            f"• <b>Action:</b> <code>{html.escape(setup['order'])}</code>\n"
+                            f"• <b>Entry:</b> <code>{setup['entry']}</code>\n"
+                            f"• <b>Stop Loss (SL):</b> <code>{setup['sl']}</code>\n"
+                            f"• <b>TP1 (1.5R+):</b> <code>{setup['tp1']}</code>\n"
+                            f"• <b>TP2 (1H DOL):</b> <code>{setup['tp2']}</code>\n"
+                            f"• <b>Note:</b> <i>{html.escape(setup['note'])}</i>"
                         )
                         send_telegram(alert_msg)
-                        triggered_setups[pair] = setup['setup_id']
+                        triggered_setups.add(setup_id)
 
-            if (now - last_15m_report) >= 900:
-                dashboard = build_actionable_dashboard(data_cache)
+            # 3. Laporan Rutin Setiap 3 Jam Sekali (00, 03, 06, 09, 12, 15, 18, 21 UTC)
+            current_block = (now_utc.date(), now_utc.hour // 3)
+            if current_block != last_reported_block:
+                dashboard = build_actionable_dashboard(data_cache, setups_cache)
                 if dashboard:
                     send_telegram(dashboard)
-                    last_15m_report = now
+                    last_reported_block = current_block
+                    print(f"Laporan rutin 3-jam berhasil dikirim untuk blok {current_block}.")
 
         except Exception as e:
-            print(f"Error loop utama: {e}")
+            print(f"Error pada loop utama: {sanitize_log(e)}")
 
-        # Dynamic Throttling: 15 menit saat Sydney/Off-hours, 5 menit saat Tokyo/London/NY
+        # 4. Adaptive Sleep dengan Pengaman Waktu Relay (Anti-Timeout Kill)
+        remaining_time = MAX_RUNTIME_SECONDS - (time.time() - start_time)
+        if remaining_time <= 0:
+            break
+
         current_session = get_current_session()
         sleep_duration = OFFHOURS_CHECK_INTERVAL if "Sydney" in current_session else ACTIVE_CHECK_INTERVAL
-        time.sleep(sleep_duration)
+        actual_sleep = min(sleep_duration, remaining_time)
+
+        if actual_sleep > 0:
+            time.sleep(actual_sleep)
+
+    print("Siklus 5.5 jam selesai dengan normal (exit 0). Memicu Auto-Relay ke runner berikutnya...")
 
 
 if __name__ == "__main__":
