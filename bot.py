@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
+GITHUB_EVENT_NAME = os.getenv("GITHUB_EVENT_NAME", "manual")
 
 WIB_TZ = ZoneInfo("Asia/Jakarta")
 
@@ -22,17 +23,15 @@ PORTFOLIO = {
 
 TIMEFRAME = "15min"
 OUTPUTSIZE = 400                     # 400 candle 15m = 100 jam (cukup untuk 1H tanpa ekstra API call)
-MAX_RUNTIME_SECONDS = 330 * 60       # 5.5 jam (19.800 detik) agar aman sebelum timeout 360 menit YAML
+MAX_RUNTIME_SECONDS = 330 * 60       # 5.5 jam (19.800 detik)
 ACTIVE_CHECK_INTERVAL = 300          # Cek tiap 5 menit saat Tokyo/London/NY
-OFFHOURS_CHECK_INTERVAL = 900        # Cek tiap 15 menit saat Sydney/Off-hours (Hemat Kuota API)
+OFFHOURS_CHECK_INTERVAL = 900        # Cek tiap 15 menit saat Sydney/Off-hours
 
-# Gunakan Session untuk efisiensi koneksi TCP/TLS
 HTTP_SESSION = requests.Session()
 
 
 # ----------------- UTILITAS KEAMANAN & TELEGRAM -----------------
 def sanitize_log(text: str) -> str:
-    """Menyensor kredensial sensitif agar tidak pernah bocor ke log publik GitHub Actions"""
     safe_text = str(text)
     for secret in (TWELVE_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID):
         if secret:
@@ -48,7 +47,7 @@ def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message[:4090],  # Proteksi batas 4096 karakter Telegram
+        "text": message[:4090],
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
@@ -62,7 +61,6 @@ def send_telegram(message: str):
 
 # ----------------- MANAJEMEN WAKTU & SESI MARKET -----------------
 def is_forex_market_closed(now_utc: datetime = None) -> bool:
-    """Pasar Forex tutup dari Jumat 22:00 UTC (Sabtu 05:00 WIB) s/d Minggu 22:00 UTC (Senin 05:00 WIB)"""
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     weekday = now_utc.weekday()
@@ -91,7 +89,6 @@ def get_current_session(now_utc: datetime = None) -> str:
 
 
 def is_in_ict_killzone(now_utc: datetime = None) -> bool:
-    """Validasi ICT Killzone: London Open (07:00-10:00 UTC) & NY Open (12:00-16:00 UTC)"""
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     hour = now_utc.hour
@@ -100,7 +97,6 @@ def is_in_ict_killzone(now_utc: datetime = None) -> bool:
 
 # ----------------- DATA FETCHING & INDIKATOR -----------------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Menghitung EMA 50, Wilder's RSI 14, dan Wilder's ATR 14"""
     df = df.copy()
     df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
 
@@ -119,7 +115,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_twelve_data(symbol: str):
-    """Mengambil 400 candle 15m dalam zona waktu UTC murni"""
     if not TWELVE_API_KEY:
         print("Error: TWELVE_API_KEY belum diset di GitHub Secrets!")
         return None
@@ -129,7 +124,7 @@ def fetch_twelve_data(symbol: str):
         "symbol": symbol,
         "interval": TIMEFRAME,
         "outputsize": OUTPUTSIZE,
-        "timezone": "UTC",  # Kunci di UTC agar resampling 1H dan Killzone 100% akurat
+        "timezone": "UTC",
         "apikey": TWELVE_API_KEY
     }
     try:
@@ -157,13 +152,12 @@ def fetch_twelve_data(symbol: str):
 
 
 def resample_to_1h(df_15m: pd.DataFrame) -> pd.DataFrame:
-    """Merakit DataFrame 1H (HTF) utuh tanpa partial candle di ujung awal"""
+    """Merakit DataFrame 1H (HTF) utuh kompatibel dengan Pandas 2.0+"""
     df_htf = (
         df_15m.set_index('datetime')
         .resample('1h')
-        .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'close_count': ('close', 'count')})
+        .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'})
     )
-    # Fix Partial First Candle: Jika candle 1H paling kiri tidak dimulai dari menit :00 (kurang dari 4 bar M15), buang
     if len(df_htf) > 2 and df_15m.iloc[0]['datetime'].minute != 0:
         df_htf = df_htf.iloc[1:]
 
@@ -173,7 +167,6 @@ def resample_to_1h(df_15m: pd.DataFrame) -> pd.DataFrame:
 
 # ----------------- ALGORITMA SMC & ICT -----------------
 def find_fractals(df: pd.DataFrame, left: int = 2, right: int = 2):
-    """Mendeteksi Swing High dan Swing Low berbasis 5-bar Williams Fractal"""
     swing_highs = []
     swing_lows = []
     highs = df['high'].values
@@ -192,7 +185,6 @@ def find_fractals(df: pd.DataFrame, left: int = 2, right: int = 2):
 
 
 def extract_valid_dealing_range(df_closed: pd.DataFrame, sh_list: list, sl_list: list):
-    """Memastikan Dealing Range selalu valid (Swing High > Swing Low) dan tidak terbalik"""
     if not sh_list or not sl_list:
         return None, None, None, None
 
@@ -200,8 +192,6 @@ def extract_valid_dealing_range(df_closed: pd.DataFrame, sh_list: list, sl_list:
     sl_idx, sl_val = sl_list[-1]
     atr = df_closed.iloc[-1]['atr']
 
-    # Jika fractal terakhir tidak valid (sh_val <= sl_val) atau terlalu sempit (< 0.8 ATR),
-    # cari pasangan ekstrem dari 40 candle terakhir sebagai anchor Dealing Range
     if sh_val <= sl_val or (sh_val - sl_val) < (0.8 * atr):
         window = df_closed.iloc[-40:]
         sh_idx = int(window['high'].idxmax())
@@ -216,7 +206,6 @@ def extract_valid_dealing_range(df_closed: pd.DataFrame, sh_list: list, sl_list:
 
 
 def analyze_htf_1h(df_15m: pd.DataFrame):
-    """Menganalisa Struktur 1H, Dealing Range (Premium/Discount), dan Liquidity Sweep dengan hierarki ketat"""
     df_1h = resample_to_1h(df_15m)
     closed_1h = df_1h.iloc[:-1].copy().reset_index(drop=True)
 
@@ -236,14 +225,12 @@ def analyze_htf_1h(df_15m: pd.DataFrame):
 
     zone = "DISCOUNT" if live_price <= htf_eq else "PREMIUM"
 
-    # Deteksi 1H Liquidity Sweep (Turtle Soup) & Break of Structure (BOS)
     htf_swept_ssl = (recent_1h['low'] < htf_sl).any() and (last_1h['close'] > htf_sl)
     htf_swept_bsl = (recent_1h['high'] > htf_sh).any() and (last_1h['close'] < htf_sh)
 
     htf_bull_bos = last_1h['close'] > htf_sh
     htf_bear_bos = last_1h['close'] < htf_sl
 
-    # Hierarki Prioritas Tanpa Tabrakan (Sweep > Pure BOS > EMA50 Structure)
     if htf_swept_ssl and not htf_swept_bsl:
         bias = "BULLISH"
     elif htf_swept_bsl and not htf_swept_ssl:
@@ -275,13 +262,11 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
     live_low = float(live_candle['low'])
     live_high = float(live_candle['high'])
 
-    # 1. Analisa Bias Higher Timeframe (1H)
     htf = analyze_htf_1h(df)
     htf_bias = htf["bias"]
     htf_zone = htf["zone"]
     htf_summary = f"1H: {htf_bias} ({htf_zone})"
 
-    # 2. Evaluasi Struktur Lower Timeframe (15M) pada candle yang sudah close
     closed_df = df.iloc[:-1].copy().reset_index(drop=True)
     last_closed = closed_df.iloc[-1]
     atr = float(last_closed['atr'])
@@ -304,7 +289,6 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
 
     eq_15m = (swing_high + swing_low) / 2.0
 
-    # 3. Konfirmasi 15M MSS (BOS / Liquidity Sweep) beserta indeks kronologisnya
     recent_8 = closed_df.iloc[-8:]
     swept_ssl_mask = recent_8['low'] < swing_low
     swept_bsl_mask = recent_8['high'] > swing_high
@@ -318,11 +302,9 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
     bullish_mss = (bos_bull_mask.any() or swept_ssl_15m) and (last_closed['close'] > ema50)
     bearish_mss = (bos_bear_mask.any() or swept_bsl_15m) and (last_closed['close'] < ema50)
 
-    # Titik awal kaki impulsif agar FVG yang diambil tidak mendahului sweep ekstrem
     bull_origin_idx = int(recent_8['low'].idxmin())
     bear_origin_idx = int(recent_8['high'].idxmax())
 
-    # 4. Deteksi Unmitigated & Unviolated FVG 15M
     bull_fvg = None
     bear_fvg = None
 
@@ -336,11 +318,9 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
 
         c2_body = abs(c2['close'] - c2['open'])
         is_displacement = c2_body > (0.40 * atr)
-
-        # Candle yang sudah tutup setelah FVG selesai terbentuk (c3 adalah i+2, jadi setelahnya adalah i+3)
         after_closed = closed_df.iloc[i + 3:]
 
-        # --- Evaluasi Bullish FVG ---
+        # Bullish FVG
         if (i + 1) >= bull_origin_idx and is_displacement and (c3['low'] - c1['high']) > (0.12 * atr):
             fvg_bot = float(c1['high'])
             fvg_top = float(c3['low'])
@@ -348,25 +328,22 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
             ob_low = float(min(c1['low'], c2['low']))
             planned_entry = fvg_top if fvg_top <= eq_15m else ce_bull
 
-            # Syarat 1 (Unviolated): Belum ada candle close di bawah fvg_bot & belum menyentuh SL (ob_low)
             unviolated = True
             already_used = False
 
             if len(after_closed) > 0:
                 if (after_closed['close'] < fvg_bot).any() or (after_closed['low'] <= ob_low).any():
                     unviolated = False
-                # Syarat 2 (Freshness): Jika candle lama (selain 1 candle terakhir) sudah menyentuh entry lalu lari > 1 ATR, FVG sudah terpakai
                 older_closed = after_closed.iloc[:-1]
                 if len(older_closed) > 0 and (older_closed['low'] <= planned_entry).any():
                     if (after_closed['high'] >= planned_entry + atr).any():
                         already_used = True
 
-            # Cek juga apakah candle live saat ini sudah menjebol titik SL
             if unviolated and not already_used and (live_low > ob_low):
                 fvg_time = c2['datetime'].strftime('%Y%m%d_%H%M')
                 bull_fvg = (fvg_bot, fvg_top, ce_bull, ob_low, fvg_time)
 
-        # --- Evaluasi Bearish FVG ---
+        # Bearish FVG
         if (i + 1) >= bear_origin_idx and is_displacement and (c1['low'] - c3['high']) > (0.12 * atr):
             fvg_bot = float(c3['high'])
             fvg_top = float(c1['low'])
@@ -400,7 +377,6 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
         "note": f"15M Range: {swing_low:.{digits}f} - {swing_high:.{digits}f}"
     }
 
-    # 5. Eksekusi BUY: Wajib Searah dengan Bias 1H BULLISH
     if htf_bias == "BULLISH" and bullish_mss and bull_fvg:
         fvg_bot, fvg_top, fvg_ce, ob_low, fvg_id = bull_fvg
         entry_price = fvg_top if fvg_top <= eq_15m else fvg_ce
@@ -415,7 +391,6 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
             is_aplus = (htf_zone == "DISCOUNT") and in_kz
             grade = " [A+ ICT 🔥]" if is_aplus else " [B-Grade ⚠️]"
 
-            # Deteksi apakah harga saat ini sedang berada di dalam zona FVG atau baru menyentuhnya di candle terakhir
             in_fvg_zone = (
                 (fvg_bot - 0.05 * atr <= live_low <= fvg_top + 0.05 * atr)
                 or (fvg_bot <= last_closed['low'] <= fvg_top and live_close <= entry_price + 0.3 * atr)
@@ -428,7 +403,7 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
                 order_type = f"BUY LIMIT (FVG) 🟢{grade}"
                 stage = "LIMIT"
             else:
-                return setup  # Harga sudah tembus jauh di bawah FVG
+                return setup
 
             setup = {
                 "order": order_type,
@@ -442,7 +417,6 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
                 "note": f"1H Bullish + 15M FVG ({fvg_bot:.{digits}f}-{fvg_top:.{digits}f})"
             }
 
-    # 6. Eksekusi SELL: Wajib Searah dengan Bias 1H BEARISH
     elif htf_bias == "BEARISH" and bearish_mss and bear_fvg:
         fvg_bot, fvg_top, fvg_ce, ob_high, fvg_id = bear_fvg
         entry_price = fvg_bot if fvg_bot >= eq_15m else fvg_ce
@@ -487,7 +461,7 @@ def generate_trade_setup(pair: str, df: pd.DataFrame, cfg: dict):
 
 
 # ----------------- FORMATTER DASHBOARD & SINYAL -----------------
-def build_actionable_dashboard(data_dict: dict, setups_cache: dict):
+def build_actionable_dashboard(data_dict: dict, setups_cache: dict, is_startup: bool = False):
     valid_pairs = {k: v for k, v in data_dict.items() if v is not None}
     if not valid_pairs:
         return None
@@ -497,7 +471,11 @@ def build_actionable_dashboard(data_dict: dict, setups_cache: dict):
     session = get_current_session(now_utc)
     kz_status = "ACTIVE 🔥" if is_in_ict_killzone(now_utc) else "INACTIVE 💤"
 
-    msg = "⚡ <b>ICT &amp; SMC 3-HOURLY MARKET OUTLOOK (1H ➔ 15M)</b> ⚡\n"
+    if is_startup:
+        msg = "🟢 <b>ENGINE ACTIVE ✅ — INITIAL MARKET SCAN</b>\n"
+    else:
+        msg = "⚡ <b>ICT &amp; SMC 3-HOURLY MARKET OUTLOOK (1H ➔ 15M)</b> ⚡\n"
+
     msg += f"Sesi: <b>{session}</b> | Killzone: <b>{kz_status}</b>\n"
     msg += f"Waktu: <code>{now_wib.strftime('%H:%M')} WIB</code> (<code>{now_utc.strftime('%H:%M')} UTC</code>)\n"
     msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -519,7 +497,7 @@ def build_actionable_dashboard(data_dict: dict, setups_cache: dict):
         msg += f"• <b>Kondisi:</b> RSI <code>{curr['rsi']:.1f}</code> | <i>{safe_note}</i>\n"
         msg += "──────────────────────\n"
 
-    msg += "<i>Engine: 1H Dealing Range + 15M Fractal MSS + Unmitigated FVG</i>"
+    msg += "<i>Jadwal: Update rutin tiap 3 jam | Sinyal Setup dikirim Instan</i>"
     return msg
 
 
@@ -529,20 +507,22 @@ def main():
     triggered_setups = set()
     weekend_notified = False
 
-    # Zero-State Relay Synchronization untuk Laporan 3 Jam:
-    # Blok 3 jam dihitung berdasarkan (Tanggal UTC, Jam UTC // 3) -> 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 UTC
-    # Jika runner baru menyala di tengah blok (bukan di 16 menit pertama jam kelipatan 3),
-    # tandai blok saat ini sudah terkirim agar pergantian estafet runner tidak memicu spam laporan.
     init_utc = datetime.now(timezone.utc)
     init_block = (init_utc.date(), init_utc.hour // 3)
-    if init_utc.hour % 3 == 0 and init_utc.minute < 16:
-        last_reported_block = None
-    else:
+
+    # Jika diaktifkan manual/push (bukan repository_dispatch dari estafet otomatis),
+    # kirimkan pesan ENGINE ACTIVE ✅ di siklus pertama!
+    is_manual_start = (GITHUB_EVENT_NAME != "repository_dispatch")
+    if not is_manual_start and not (init_utc.hour % 3 == 0 and init_utc.minute < 16):
         last_reported_block = init_block
+    else:
+        last_reported_block = None
+
+    first_cycle = True
 
     print(
-        f"Engine dimulai pada {init_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC. "
-        f"Batas Relay: {MAX_RUNTIME_SECONDS // 60} menit."
+        f"Engine dimulai pada {init_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC "
+        f"(Event: {GITHUB_EVENT_NAME}). Batas Relay: {MAX_RUNTIME_SECONDS // 60} menit."
     )
 
     while (time.time() - start_time) < MAX_RUNTIME_SECONDS:
@@ -561,7 +541,7 @@ def main():
                         if df is not None:
                             setups_cache[pair] = generate_trade_setup(pair, df, cfg)
 
-                    dashboard = build_actionable_dashboard(data_cache, setups_cache)
+                    dashboard = build_actionable_dashboard(data_cache, setups_cache, is_startup=first_cycle)
                     if dashboard:
                         send_telegram(
                             "⏸️ <b>MODE AKHIR PEKAN (PASAR TUTUP)</b>\n"
@@ -569,6 +549,7 @@ def main():
                             + dashboard
                         )
                     weekend_notified = True
+                    first_cycle = False
 
                 remaining = MAX_RUNTIME_SECONDS - (time.time() - start_time)
                 if remaining <= 0:
@@ -581,7 +562,7 @@ def main():
             data_cache = {}
             setups_cache = {}
 
-            # 2. Pemindaian Market & Deteksi Setup Instan (Prioritas Utama)
+            # 2. Pemindaian Market & Deteksi Setup Instan
             for pair, cfg in PORTFOLIO.items():
                 df = fetch_twelve_data(cfg["symbol"])
                 data_cache[pair] = df
@@ -590,7 +571,6 @@ def main():
                     setup = generate_trade_setup(pair, df, cfg)
                     setups_cache[pair] = setup
 
-                    # Kirim sinyal INSTAN kapan saja jika ada Setup Valid (baik LIMIT baru maupun eksekusi NOW)
                     setup_id = setup.get("setup_id")
                     if setup_id and setup_id not in triggered_setups:
                         now_wib = now_utc.astimezone(WIB_TZ)
@@ -613,19 +593,22 @@ def main():
                         send_telegram(alert_msg)
                         triggered_setups.add(setup_id)
 
-            # 3. Laporan Rutin Setiap 3 Jam Sekali (00, 03, 06, 09, 12, 15, 18, 21 UTC)
+            # 3. Laporan Startup Perdana ATAU Laporan Rutin Setiap 3 Jam Sekali
             current_block = (now_utc.date(), now_utc.hour // 3)
             if current_block != last_reported_block:
-                dashboard = build_actionable_dashboard(data_cache, setups_cache)
+                is_startup_msg = first_cycle and is_manual_start
+                dashboard = build_actionable_dashboard(data_cache, setups_cache, is_startup=is_startup_msg)
                 if dashboard:
                     send_telegram(dashboard)
                     last_reported_block = current_block
-                    print(f"Laporan rutin 3-jam berhasil dikirim untuk blok {current_block}.")
+                    print(f"Dashboard berhasil dikirim (Startup={is_startup_msg}, Blok={current_block}).")
+
+            first_cycle = False
 
         except Exception as e:
             print(f"Error pada loop utama: {sanitize_log(e)}")
 
-        # 4. Adaptive Sleep dengan Pengaman Waktu Relay (Anti-Timeout Kill)
+        # 4. Adaptive Sleep dengan Pengaman Waktu Relay
         remaining_time = MAX_RUNTIME_SECONDS - (time.time() - start_time)
         if remaining_time <= 0:
             break
